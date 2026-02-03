@@ -1,0 +1,22 @@
+# Telegram client libraries
+telethon==1.34.0
+python-telegram-bot==13.5
+
+# Database
+sqlalchemy==2.0.23
+alembic==1.13.1
+
+# Utilities
+python-dotenv==1.0.0
+aiofiles==23.2.1
+python-magic==0.4.27
+
+# Proxy support
+pysocks==1.7.1
+
+# Data processing
+opentele==1.15.1
+
+# Configuration
+pyyaml==6.0.1
+httpx==0.13.3
