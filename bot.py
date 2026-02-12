@@ -8323,7 +8323,7 @@ async def auto_refresh_task_progress(bot, chat_id, message_id, task_id):
             account_section = ""
             if account_info:
                 masked_phone = mask_phone_number(account_info['phone'])
-                remaining_quota = account_info['daily_limit'] - account_info['sent_today']
+                remaining_quota = max(0, account_info['daily_limit'] - account_info['sent_today'])
                 account_section = (
                     f"\n📱 <b>当前账号</b>\n"
                     f"• 账号: {masked_phone}\n"
@@ -8366,9 +8366,10 @@ async def auto_refresh_task_progress(bot, chat_id, message_id, task_id):
             reply_markup = InlineKeyboardMarkup(keyboard)
             
             # Update message only if data changed
-            # Use timestamp of most recent log instead of count to detect new entries
+            # Use both timestamp and count for reliable change detection
             recent_log_timestamp = recent_logs[-1]['time'] if recent_logs else None
-            current_data = (sent_count, failed_count, task.status, recent_log_timestamp)
+            recent_log_count = len(recent_logs) if recent_logs else 0
+            current_data = (sent_count, failed_count, task.status, recent_log_timestamp, recent_log_count)
             if current_data != last_data:
                 try:
                     await bot.edit_message_text(
@@ -8637,7 +8638,7 @@ async def refresh_task_progress(query, task_id):
     account_section = ""
     if account_info:
         masked_phone = mask_phone_number(account_info['phone'])
-        remaining_quota = account_info['daily_limit'] - account_info['sent_today']
+        remaining_quota = max(0, account_info['daily_limit'] - account_info['sent_today'])
         account_section = (
             f"\n📱 <b>当前账号</b>\n"
             f"• 账号: {masked_phone}\n"
