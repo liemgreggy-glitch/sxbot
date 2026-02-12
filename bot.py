@@ -1898,6 +1898,8 @@ class TaskManager:
         self.report_retry_count = {}  # Track report send retry attempts {task_id: count}
         self.bot_application = bot_application  # 用于发送完成报告
         self._account_check_cache = {}  # Cache for check_and_stop_if_no_accounts {task_id: {'result': bool, 'checked_at': datetime}}
+        self.recent_logs = {}  # {task_id: [{'time': datetime, 'target': str, 'status': str, 'message': str, 'account': str}, ...]}
+        self.stop_events = {}  # {task_id: asyncio.Event} - for reply monitoring
     
     def create_task(self, name, message_text, message_format, media_type=MediaType.TEXT,
                    media_path=None, send_method=SendMethod.DIRECT, postbot_code=None, 
@@ -3296,13 +3298,53 @@ class TaskManager:
                     status_emoji = "✅"
                     status_msg = "任务完成！"
                 
+                # Calculate runtime and speed
+                runtime_str = "未知"
+                speed_str = "0.0 条/分钟"
+                if task.started_at and task.completed_at:
+                    runtime = task.completed_at - task.started_at
+                    hours, remainder = divmod(int(runtime.total_seconds()), 3600)
+                    minutes, seconds = divmod(remainder, 60)
+                    runtime_str = f"{hours}:{minutes:02d}:{seconds:02d}"
+                    
+                    # Calculate speed
+                    if total_messages > 0 and runtime.total_seconds() > 0:
+                        speed = total_messages / runtime.total_seconds() * 60  # messages per minute
+                        speed_str = f"{speed:.1f} 条/分钟"
+                
+                # Build failure reason summary
+                failure_summary = ""
+                error_categories = {}
+                for log in results['logs']:
+                    if not log.success:
+                        error_type = self._categorize_error(log.error_message)
+                        error_categories[error_type] = error_categories.get(error_type, 0) + 1
+                
+                if error_categories:
+                    failure_summary = "\n\n📋 <b>失败原因分类</b>:\n"
+                    for error_type, count in sorted(error_categories.items(), key=lambda x: x[1], reverse=True):
+                        failure_summary += f"• {error_type}: {count} 次\n"
+                
+                # Build account summary
+                account_summary = ""
+                if account_stats:
+                    account_summary = "\n\n📱 <b>账号统计</b>:\n"
+                    for account_id, stats in list(account_stats.items())[:5]:  # Show top 5 accounts
+                        total = stats['success'] + stats['failed']
+                        account_summary += f"• {stats['phone']}: 成功{stats['success']}/失败{stats['failed']} (共{total})\n"
+                
                 completion_text = (
                     f"{status_emoji} <b>{status_msg}</b>\n\n"
-                    f"📊 任务统计：\n"
+                    f"📊 <b>任务统计</b>:\n"
                     f"✅ 发送成功: {total_messages} 条消息\n"
                     f"📧 成功用户: {unique_users} 人\n"
                     f"❌ 发送失败: {len(results['failed_targets'])} 人\n"
                     f"⏸️ 剩余未发送: {remaining_count} 人\n\n"
+                    f"⏱️ <b>时间统计</b>:\n"
+                    f"• 运行时间: {runtime_str}\n"
+                    f"• 平均速度: {speed_str}\n"
+                    f"{account_summary}"
+                    f"{failure_summary}\n\n"
                     f"📁 正在发送日志报告..."
                 )
                 
@@ -3551,6 +3593,16 @@ class TaskManager:
                     {'$set': {'is_valid': False, 'error_message': str(e)}}
                 )
                 self._log_message(str(task._id), str(account._id), str(target._id), task.message_text, False, str(e))
+                
+                # Add to recent logs
+                self._add_recent_log(str(task._id), {
+                    'time': datetime.now(),
+                    'target': target.username or str(target.user_id),
+                    'status': 'failed',
+                    'message': target.last_error,
+                    'account': account.phone
+                })
+                
                 return False
             
             # 提取用户信息用于消息个性化
@@ -3659,6 +3711,16 @@ class TaskManager:
             )
             
             self._log_message(str(task._id), str(account._id), str(target._id), personalized, True, None)
+            
+            # Add to recent logs
+            self._add_recent_log(str(task._id), {
+                'time': datetime.now(),
+                'target': target.username or str(target.user_id),
+                'status': 'success',
+                'message': '发送成功',
+                'account': account.phone
+            })
+            
             logger.info(f"Message sent to {recipient}")
             return True
             
@@ -3680,6 +3742,16 @@ class TaskManager:
                 {'$set': {'error_message': error_msg}}
             )
             self._log_message(str(task._id), str(account._id), str(target._id), task.message_text, False, error_msg)
+            
+            # Add to recent logs
+            self._add_recent_log(str(task._id), {
+                'time': datetime.now(),
+                'target': target.username or str(target.user_id),
+                'status': 'failed',
+                'message': target.last_error,
+                'account': account.phone
+            })
+            
             return False
             
         except FloodWaitError as e:
@@ -3709,6 +3781,15 @@ class TaskManager:
                 )
             
             self._log_message(str(task._id), str(account._id), str(target._id), task.message_text, False, error_msg)
+            
+            # Add to recent logs
+            self._add_recent_log(str(task._id), {
+                'time': datetime.now(),
+                'target': target.username or str(target.user_id),
+                'status': 'failed',
+                'message': target.last_error,
+                'account': account.phone
+            })
             
             # Handle FloodWait based on strategy
             strategy = getattr(task, 'flood_wait_strategy', 'switch_account')
@@ -3756,6 +3837,16 @@ class TaskManager:
                 )
             
             self._log_message(str(task._id), str(account._id), str(target._id), task.message_text, False, error_msg)
+            
+            # Add to recent logs
+            self._add_recent_log(str(task._id), {
+                'time': datetime.now(),
+                'target': target.username or str(target.user_id),
+                'status': 'failed',
+                'message': target.last_error,
+                'account': account.phone
+            })
+            
             return False
             
         except Exception as e:
@@ -3785,6 +3876,16 @@ class TaskManager:
                 {'$set': {'error_message': error_msg}}
             )
             self._log_message(str(task._id), str(account._id), str(target._id), task.message_text, False, error_msg)
+            
+            # Add to recent logs
+            self._add_recent_log(str(task._id), {
+                'time': datetime.now(),
+                'target': target.username or str(target.user_id),
+                'status': 'failed',
+                'message': target.last_error,
+                'account': account.phone
+            })
+            
             return False
     
     def _log_message(self, task_id, account_id, target_id, message_text, success, error_message):
@@ -3798,6 +3899,69 @@ class TaskManager:
             error_message=error_message
         )
         self.logs_col.insert_one(log.to_dict())
+    
+    def _add_recent_log(self, task_id, log_entry):
+        """Add recent log entry for task"""
+        if task_id not in self.recent_logs:
+            self.recent_logs[task_id] = []
+        
+        # Add new entry
+        self.recent_logs[task_id].append(log_entry)
+        
+        # Keep only last 20 entries
+        if len(self.recent_logs[task_id]) > 20:
+            self.recent_logs[task_id] = self.recent_logs[task_id][-20:]
+    
+    def _get_recent_logs(self, task_id, limit=5):
+        """Get recent log entries for task"""
+        if task_id not in self.recent_logs:
+            return []
+        
+        # Return last N entries
+        return self.recent_logs[task_id][-limit:] if limit else self.recent_logs[task_id]
+    
+    def _get_account_stats(self, task_id):
+        """Get account statistics for task"""
+        stats = {}
+        
+        # Get all logs for this task
+        logs = list(self.logs_col.find({'task_id': task_id}))
+        
+        for log in logs:
+            account_id = log.get('account_id')
+            if not account_id:
+                continue
+            
+            if account_id not in stats:
+                # Get account info
+                account_doc = self.db[Account.COLLECTION_NAME].find_one({'_id': ObjectId(account_id)})
+                if account_doc:
+                    account = Account.from_dict(account_doc)
+                    stats[account_id] = {
+                        'phone': account.phone,
+                        'sent': 0,
+                        'failed': 0,
+                        'total': 0,
+                        'messages_sent_today': account.messages_sent_today,
+                        'daily_limit': account.daily_limit
+                    }
+                else:
+                    stats[account_id] = {
+                        'phone': 'unknown',
+                        'sent': 0,
+                        'failed': 0,
+                        'total': 0,
+                        'messages_sent_today': 0,
+                        'daily_limit': 50
+                    }
+            
+            stats[account_id]['total'] += 1
+            if log.get('success'):
+                stats[account_id]['sent'] += 1
+            else:
+                stats[account_id]['failed'] += 1
+        
+        return stats
     
     def _categorize_error(self, error_message):
         """将错误消息分类为友好的中文描述"""
@@ -8078,18 +8242,60 @@ async def auto_refresh_task_progress(bot, chat_id, message_id, task_id):
                 speed_str = "0.0 条/分钟"
                 remaining_str = "未知"
             
+            # Get recent logs and account stats
+            recent_logs = task_manager._get_recent_logs(task_id, limit=5)
+            account_stats = task_manager._get_account_stats(task_id)
+            
+            # Build recent operations display
+            recent_ops_text = ""
+            if recent_logs:
+                recent_ops_text = "\n📝 <b>最近操作</b> (最新5条)\n"
+                for log in reversed(recent_logs[-5:]):  # Show newest first
+                    time_str = log['time'].strftime('%H:%M:%S') if isinstance(log['time'], datetime) else str(log['time'])
+                    status_icon = '✅' if log['status'] == 'success' else '❌'
+                    target = log['target']
+                    message = log['message'][:30]  # Truncate long messages
+                    recent_ops_text += f"• {time_str} {status_icon} @{target} {message}\n"
+            
+            # Build account stats display
+            account_stats_text = ""
+            if account_stats:
+                # Get current active account (last one used)
+                current_account = None
+                if recent_logs:
+                    current_account = recent_logs[-1].get('account', 'unknown')
+                    if current_account != 'unknown':
+                        # Find this account's stats
+                        for acc_id, stats in account_stats.items():
+                            if stats['phone'] == current_account:
+                                quota_used = stats['messages_sent_today']
+                                quota_total = stats['daily_limit']
+                                quota_remaining = max(0, quota_total - quota_used)
+                                account_stats_text = (
+                                    f"\n📱 <b>当前账号</b>: {current_account}\n"
+                                    f"• 账号已发送: {stats['sent']} 条\n"
+                                    f"• 账号剩余配额: {quota_remaining}/{quota_total}\n"
+                                )
+                                break
+            
             # 更新消息 - Enhanced with better visual indicators
             text = (
                 f"🚀 <b>正在私信中</b>\n\n"
-                f"📊 进度: {sent_count + failed_count}/{total_targets} ({progress_percent:.1f}%)\n"
+                f"📊 <b>进度统计</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"进度: {sent_count + failed_count}/{total_targets} ({progress_percent:.1f}%)\n"
                 f"{progress_bar}\n\n"
-                f"⚡ 速度: {speed_str}\n"
-                f"⏱️ 预计剩余: {remaining_str}\n"
-                f"⏰ 已运行: {runtime_str}\n\n"
-                f"👥 总用户数: {total_targets}\n"
-                f"✅ 发送成功: {sent_count}\n"
-                f"❌ 发送失败: {failed_count}\n\n"
-                f"💡 提示: 任务可随时停止"
+                f"⏱️ <b>时间统计</b>\n"
+                f"• 已运行: {runtime_str}\n"
+                f"• 预计剩余: {remaining_str}\n"
+                f"• 发送速度: {speed_str}\n"
+                f"{account_stats_text}"
+                f"\n📈 <b>发送统计</b>\n"
+                f"• ✅ 成功: {sent_count}\n"
+                f"• ❌ 失败: {failed_count}\n"
+                f"• ⏸️ 跳过: 0\n"
+                f"{recent_ops_text}"
+                f"\n💡 提示: 任务可随时停止"
             )
             
             keyboard = [
