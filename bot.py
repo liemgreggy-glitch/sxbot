@@ -123,6 +123,11 @@ class Config:
     MAX_AUTO_REFRESH_ERRORS = 5
     ACCOUNT_CHECK_LOOP_INTERVAL = 10
     CONSECUTIVE_FAILURES_THRESHOLD = 50
+    
+    # Display formatting constants
+    MAX_TARGET_DISPLAY_LENGTH = 15
+    MAX_MESSAGE_DISPLAY_LENGTH = 20
+    PHONE_MASK_VISIBLE_DIGITS = 4
     STOP_CONFIRMATION_ITERATIONS = 50
     STOP_CONFIRMATION_SLEEP = 0.1
     MAX_REPORT_RETRY_ATTEMPTS = 3
@@ -1323,6 +1328,40 @@ class MessageFormatter:
         elif message_format == MessageFormat.HTML:
             return 'html'
         return None
+
+
+# ============================================================================
+# Display Formatting Helpers
+# ============================================================================
+def mask_phone_number(phone: str) -> str:
+    """Mask phone number for privacy, showing only last few digits"""
+    if not phone or len(phone) < Config.PHONE_MASK_VISIBLE_DIGITS:
+        return "****"
+    return f"****{phone[-Config.PHONE_MASK_VISIBLE_DIGITS:]}"
+
+
+def format_log_entry(log: dict, max_target_len: int = None, max_msg_len: int = None) -> tuple:
+    """Format log entry for display
+    
+    Args:
+        log: Log dictionary with time, target, status, message fields
+        max_target_len: Maximum length for target display
+        max_msg_len: Maximum length for message display
+        
+    Returns:
+        Tuple of (time_str, status_emoji, target, message)
+    """
+    if max_target_len is None:
+        max_target_len = Config.MAX_TARGET_DISPLAY_LENGTH
+    if max_msg_len is None:
+        max_msg_len = Config.MAX_MESSAGE_DISPLAY_LENGTH
+    
+    time_str = log['time'].strftime('%H:%M:%S') if isinstance(log['time'], datetime) else str(log['time'])
+    status_emoji = {'success': '✅', 'failed': '❌', 'skipped': '⏸️'}.get(log['status'], '❓')
+    target = log['target'][:max_target_len] if log['target'] else 'unknown'
+    message = log['message'][:max_msg_len] if log['message'] else ''
+    
+    return time_str, status_emoji, target, message
 
 
 # ============================================================================
@@ -8283,7 +8322,7 @@ async def auto_refresh_task_progress(bot, chat_id, message_id, task_id):
             account_info = task_manager._get_current_account(task_id)
             account_section = ""
             if account_info:
-                masked_phone = f"****{account_info['phone'][-4:]}" if len(account_info['phone']) >= 4 else "****"
+                masked_phone = mask_phone_number(account_info['phone'])
                 remaining_quota = account_info['daily_limit'] - account_info['sent_today']
                 account_section = (
                     f"\n📱 <b>当前账号</b>\n"
@@ -8298,10 +8337,7 @@ async def auto_refresh_task_progress(bot, chat_id, message_id, task_id):
             if recent_logs:
                 logs_section = "\n📝 <b>最近操作</b>\n━━━━━━━━━━━━━━━━\n"
                 for log in reversed(recent_logs):  # Show newest first
-                    time_str = log['time'].strftime('%H:%M:%S') if isinstance(log['time'], datetime) else str(log['time'])
-                    status_emoji = {'success': '✅', 'failed': '❌', 'skipped': '⏸️'}.get(log['status'], '❓')
-                    target = log['target'][:15] if log['target'] else 'unknown'
-                    message = log['message'][:20] if log['message'] else ''
+                    time_str, status_emoji, target, message = format_log_entry(log)
                     logs_section += f"{time_str} {status_emoji} {target} {message}\n"
             
             # Build enhanced message
@@ -8352,7 +8388,7 @@ async def auto_refresh_task_progress(bot, chat_id, message_id, task_id):
                     error_count += 1
                     logger.error(f"Failed to update progress: {e}")
             
-            if error_count >= 5:
+            if error_count >= Config.MAX_AUTO_REFRESH_ERRORS:
                 break
             
             # Dynamic refresh interval
@@ -8363,7 +8399,7 @@ async def auto_refresh_task_progress(bot, chat_id, message_id, task_id):
         except Exception as e:
             error_count += 1
             logger.error(f"Error in auto refresh: {e}")
-            if error_count >= 5:
+            if error_count >= Config.MAX_AUTO_REFRESH_ERRORS:
                 break
             await asyncio.sleep(10)
 
@@ -8598,7 +8634,7 @@ async def refresh_task_progress(query, task_id):
     account_info = task_manager._get_current_account(task_id)
     account_section = ""
     if account_info:
-        masked_phone = f"****{account_info['phone'][-4:]}" if len(account_info['phone']) >= 4 else "****"
+        masked_phone = mask_phone_number(account_info['phone'])
         remaining_quota = account_info['daily_limit'] - account_info['sent_today']
         account_section = (
             f"\n📱 <b>当前账号</b>\n"
@@ -8613,10 +8649,7 @@ async def refresh_task_progress(query, task_id):
     if recent_logs:
         logs_section = "\n📝 <b>最近操作</b>\n━━━━━━━━━━━━━━━━\n"
         for log in reversed(recent_logs):  # Show newest first
-            time_str = log['time'].strftime('%H:%M:%S') if isinstance(log['time'], datetime) else str(log['time'])
-            status_emoji = {'success': '✅', 'failed': '❌', 'skipped': '⏸️'}.get(log['status'], '❓')
-            target = log['target'][:15] if log['target'] else 'unknown'
-            message = log['message'][:20] if log['message'] else ''
+            time_str, status_emoji, target, message = format_log_entry(log)
             logs_section += f"{time_str} {status_emoji} {target} {message}\n"
     
     # Build enhanced message
