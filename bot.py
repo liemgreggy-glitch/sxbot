@@ -1902,6 +1902,7 @@ class TaskManager:
         self._account_check_cache = {}  # Cache for check_and_stop_if_no_accounts {task_id: {'result': bool, 'checked_at': datetime}}
         self.recent_logs = {}  # {task_id: [{'time': datetime, 'target': str, 'status': str, 'message': str, 'account': str}, ...]}
         self.stop_events = {}  # {task_id: asyncio.Event} - for reply monitoring
+        self.current_account_info = {}  # {task_id: {'phone': str, 'sent_today': int, 'daily_limit': int}}
     
     def create_task(self, name, message_text, message_format, media_type=MediaType.TEXT,
                    media_path=None, send_method=SendMethod.DIRECT, postbot_code=None, 
@@ -2550,6 +2551,10 @@ class TaskManager:
                 
                 # 发送消息 - Use stop-aware wrapper
                 logger.info(f"[批次 {batch_idx}] 使用账户 {account.phone} 尝试发送")
+                
+                # Update current account info
+                self._update_current_account(task_id, account)
+                
                 success = await self._send_message_with_stop_check(task, target, account, stop_event)
                 
                 if not success:
@@ -2650,6 +2655,9 @@ class TaskManager:
             consecutive_failures = 0  # 连续失败计数器
             
             logger.info(f"📱 账号 {account.phone} ({account_idx + 1}/{len(accounts)}) 开始工作")
+            
+            # Update current account info
+            self._update_current_account(task_id, account)
             
             # 获取该账号应该发送的目标列表
             available_targets = self._get_available_targets_for_account(
@@ -3925,6 +3933,19 @@ class TaskManager:
         
         # Return last N entries
         return self.recent_logs[task_id][-limit:] if limit else self.recent_logs[task_id]
+    
+    def _update_current_account(self, task_id, account):
+        """Update current account information for task"""
+        task_id_str = str(task_id)
+        self.current_account_info[task_id_str] = {
+            'phone': account.phone,
+            'sent_today': account.messages_sent_today,
+            'daily_limit': account.daily_limit
+        }
+    
+    def _get_current_account(self, task_id):
+        """Get current account information for task"""
+        return self.current_account_info.get(str(task_id))
     
     def _get_account_stats(self, task_id):
         """Get account statistics for task"""
@@ -5840,7 +5861,15 @@ async def show_task_config(query, task_id):
     ]
     
     reply_markup = InlineKeyboardMarkup(keyboard)
-    await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='HTML')
+    
+    # Fix Bug 2: Handle "Message to edit not found" error
+    try:
+        await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='HTML')
+    except telegram_error.BadRequest as e:
+        if "Message to edit not found" in str(e) or "message to edit not found" in str(e):
+            await query.message.reply_text(text, reply_markup=reply_markup, parse_mode='HTML')
+        else:
+            raise
 
 
 async def request_thread_config(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -8221,7 +8250,12 @@ async def auto_refresh_task_progress(bot, chat_id, message_id, task_id):
             
             # 计算时间和速度
             if task.started_at:
-                runtime = datetime.now(timezone.utc) - task.started_at
+                # 确保时区一致 - Fix Bug 1
+                started_at = task.started_at
+                if started_at.tzinfo is None:
+                    started_at = started_at.replace(tzinfo=timezone.utc)
+                
+                runtime = datetime.now(timezone.utc) - started_at
                 hours, remainder = divmod(int(runtime.total_seconds()), 3600)
                 minutes, seconds = divmod(remainder, 60)
                 runtime_str = f"{hours}:{minutes:02d}:{seconds:02d}"
@@ -8575,7 +8609,11 @@ async def refresh_task_progress(query, task_id):
                 text += f"\n⏱️ 预计剩余: {estimated_time}"
         
         if task.started_at:
-            elapsed = datetime.utcnow() - task.started_at
+            # 确保时区一致 - Fix Bug 1
+            started_at = task.started_at
+            if started_at.tzinfo is None:
+                started_at = started_at.replace(tzinfo=timezone.utc)
+            elapsed = datetime.now(timezone.utc) - started_at
             text += f"\n⏰ 已运行: {elapsed}"
     
     # 创建内联按钮 - 左侧标签，右侧数值
