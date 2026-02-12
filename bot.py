@@ -9095,7 +9095,9 @@ def main():
             CallbackQueryHandler(request_bidirect_config, pattern='^cfg_bidirect_'),
             CallbackQueryHandler(request_daily_limit_config, pattern='^cfg_daily_limit_'),
             CallbackQueryHandler(request_retry_config, pattern='^cfg_retry_'),
-            CallbackQueryHandler(request_reply_mode_config, pattern='^cfg_reply_mode_')
+            CallbackQueryHandler(request_reply_mode_config, pattern='^cfg_reply_mode_'),
+            CallbackQueryHandler(request_batch_count_config, pattern='^set_batch_count_'),
+            CallbackQueryHandler(request_batch_delay_config, pattern='^set_batch_delay_')
         ],
         states={
             CONFIG_THREAD_INPUT: [
@@ -9138,6 +9140,16 @@ def main():
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_reply_mode_config),
                 CallbackQueryHandler(handle_config_cancel, pattern='^cfg_cancel_'),
                 CallbackQueryHandler(show_config_example, pattern='^cfg_example_'),
+                CallbackQueryHandler(handle_config_return, pattern='^task_config_')
+            ],
+            CONFIG_BATCH_COUNT_INPUT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_batch_count_config),
+                CallbackQueryHandler(handle_config_cancel, pattern='^cfg_cancel_'),
+                CallbackQueryHandler(handle_config_return, pattern='^task_config_')
+            ],
+            CONFIG_BATCH_DELAY_INPUT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_batch_delay_config),
+                CallbackQueryHandler(handle_config_cancel, pattern='^cfg_cancel_'),
                 CallbackQueryHandler(handle_config_return, pattern='^task_config_')
             ]
         },
