@@ -128,6 +128,8 @@ class Config:
     MAX_REPORT_RETRY_ATTEMPTS = 3
     ACCOUNT_STATUS_CACHE_DURATION = 300
     ACCOUNT_STATUS_CHECK_CACHE_DURATION = 30
+    MAX_DISPLAYED_ACCOUNTS = 5  # Maximum number of accounts to show in summaries
+    MAX_DISPLAYED_LOGS = 5  # Maximum number of recent logs to display
     
     @classmethod
     def ensure_directories(cls):
@@ -3329,7 +3331,7 @@ class TaskManager:
                 account_summary = ""
                 if account_stats:
                     account_summary = "\n\n📱 <b>账号统计</b>:\n"
-                    for account_id, stats in list(account_stats.items())[:5]:  # Show top 5 accounts
+                    for account_id, stats in list(account_stats.items())[:Config.MAX_DISPLAYED_ACCOUNTS]:  # Show top N accounts
                         total = stats['success'] + stats['failed']
                         account_summary += f"• {stats['phone']}: 成功{stats['success']}/失败{stats['failed']} (共{total})\n"
                 
@@ -3596,7 +3598,7 @@ class TaskManager:
                 
                 # Add to recent logs
                 self._add_recent_log(str(task._id), {
-                    'time': datetime.now(),
+                    'time': datetime.utcnow(),
                     'target': target.username or str(target.user_id),
                     'status': 'failed',
                     'message': target.last_error,
@@ -3714,7 +3716,7 @@ class TaskManager:
             
             # Add to recent logs
             self._add_recent_log(str(task._id), {
-                'time': datetime.now(),
+                'time': datetime.utcnow(),
                 'target': target.username or str(target.user_id),
                 'status': 'success',
                 'message': '发送成功',
@@ -3745,7 +3747,7 @@ class TaskManager:
             
             # Add to recent logs
             self._add_recent_log(str(task._id), {
-                'time': datetime.now(),
+                'time': datetime.utcnow(),
                 'target': target.username or str(target.user_id),
                 'status': 'failed',
                 'message': target.last_error,
@@ -3784,7 +3786,7 @@ class TaskManager:
             
             # Add to recent logs
             self._add_recent_log(str(task._id), {
-                'time': datetime.now(),
+                'time': datetime.utcnow(),
                 'target': target.username or str(target.user_id),
                 'status': 'failed',
                 'message': target.last_error,
@@ -3840,7 +3842,7 @@ class TaskManager:
             
             # Add to recent logs
             self._add_recent_log(str(task._id), {
-                'time': datetime.now(),
+                'time': datetime.utcnow(),
                 'target': target.username or str(target.user_id),
                 'status': 'failed',
                 'message': target.last_error,
@@ -3879,7 +3881,7 @@ class TaskManager:
             
             # Add to recent logs
             self._add_recent_log(str(task._id), {
-                'time': datetime.now(),
+                'time': datetime.utcnow(),
                 'target': target.username or str(target.user_id),
                 'status': 'failed',
                 'message': target.last_error,
@@ -3912,10 +3914,14 @@ class TaskManager:
         if len(self.recent_logs[task_id]) > 20:
             self.recent_logs[task_id] = self.recent_logs[task_id][-20:]
     
-    def _get_recent_logs(self, task_id, limit=5):
+    def _get_recent_logs(self, task_id, limit=None):
         """Get recent log entries for task"""
         if task_id not in self.recent_logs:
             return []
+        
+        # Use default limit if not specified
+        if limit is None:
+            limit = Config.MAX_DISPLAYED_LOGS
         
         # Return last N entries
         return self.recent_logs[task_id][-limit:] if limit else self.recent_logs[task_id]
@@ -3939,7 +3945,7 @@ class TaskManager:
                     account = Account.from_dict(account_doc)
                     stats[account_id] = {
                         'phone': account.phone,
-                        'sent': 0,
+                        'success': 0,
                         'failed': 0,
                         'total': 0,
                         'messages_sent_today': account.messages_sent_today,
@@ -3948,7 +3954,7 @@ class TaskManager:
                 else:
                     stats[account_id] = {
                         'phone': 'unknown',
-                        'sent': 0,
+                        'success': 0,
                         'failed': 0,
                         'total': 0,
                         'messages_sent_today': 0,
@@ -3957,7 +3963,7 @@ class TaskManager:
             
             stats[account_id]['total'] += 1
             if log.get('success'):
-                stats[account_id]['sent'] += 1
+                stats[account_id]['success'] += 1
             else:
                 stats[account_id]['failed'] += 1
         
@@ -8243,14 +8249,14 @@ async def auto_refresh_task_progress(bot, chat_id, message_id, task_id):
                 remaining_str = "未知"
             
             # Get recent logs and account stats
-            recent_logs = task_manager._get_recent_logs(task_id, limit=5)
+            recent_logs = task_manager._get_recent_logs(task_id)
             account_stats = task_manager._get_account_stats(task_id)
             
             # Build recent operations display
             recent_ops_text = ""
             if recent_logs:
-                recent_ops_text = "\n📝 <b>最近操作</b> (最新5条)\n"
-                for log in reversed(recent_logs[-5:]):  # Show newest first
+                recent_ops_text = f"\n📝 <b>最近操作</b> (最新{Config.MAX_DISPLAYED_LOGS}条)\n"
+                for log in reversed(recent_logs[-Config.MAX_DISPLAYED_LOGS:]):  # Show newest first
                     time_str = log['time'].strftime('%H:%M:%S') if isinstance(log['time'], datetime) else str(log['time'])
                     status_icon = '✅' if log['status'] == 'success' else '❌'
                     target = log['target']
@@ -8273,7 +8279,7 @@ async def auto_refresh_task_progress(bot, chat_id, message_id, task_id):
                                 quota_remaining = max(0, quota_total - quota_used)
                                 account_stats_text = (
                                     f"\n📱 <b>当前账号</b>: {current_account}\n"
-                                    f"• 账号已发送: {stats['sent']} 条\n"
+                                    f"• 账号已发送: {stats['success']} 条\n"
                                     f"• 账号剩余配额: {quota_remaining}/{quota_total}\n"
                                 )
                                 break
