@@ -123,6 +123,11 @@ class Config:
     MAX_AUTO_REFRESH_ERRORS = 5
     ACCOUNT_CHECK_LOOP_INTERVAL = 10
     CONSECUTIVE_FAILURES_THRESHOLD = 50
+    
+    # Display formatting constants
+    MAX_TARGET_DISPLAY_LENGTH = 15
+    MAX_MESSAGE_DISPLAY_LENGTH = 20
+    PHONE_MASK_VISIBLE_DIGITS = 4
     STOP_CONFIRMATION_ITERATIONS = 50
     STOP_CONFIRMATION_SLEEP = 0.1
     MAX_REPORT_RETRY_ATTEMPTS = 3
@@ -1326,6 +1331,40 @@ class MessageFormatter:
 
 
 # ============================================================================
+# Display Formatting Helpers
+# ============================================================================
+def mask_phone_number(phone: str) -> str:
+    """Mask phone number for privacy, showing only last few digits"""
+    if not phone or len(phone) < Config.PHONE_MASK_VISIBLE_DIGITS:
+        return "****"
+    return f"****{phone[-Config.PHONE_MASK_VISIBLE_DIGITS:]}"
+
+
+def format_log_entry(log: dict, max_target_len: int = None, max_msg_len: int = None) -> tuple:
+    """Format log entry for display
+    
+    Args:
+        log: Log dictionary with time, target, status, message fields
+        max_target_len: Maximum length for target display
+        max_msg_len: Maximum length for message display
+        
+    Returns:
+        Tuple of (time_str, status_emoji, target, message)
+    """
+    if max_target_len is None:
+        max_target_len = Config.MAX_TARGET_DISPLAY_LENGTH
+    if max_msg_len is None:
+        max_msg_len = Config.MAX_MESSAGE_DISPLAY_LENGTH
+    
+    time_str = log['time'].strftime('%H:%M:%S') if isinstance(log['time'], datetime) else str(log['time'])
+    status_emoji = {'success': '✅', 'failed': '❌', 'skipped': '⏸️'}.get(log['status'], '❓')
+    target = log['target'][:max_target_len] if log['target'] else 'unknown'
+    message = log['message'][:max_msg_len] if log['message'] else ''
+    
+    return time_str, status_emoji, target, message
+
+
+# ============================================================================
 # 编辑模式和回复模式类
 # ============================================================================
 class EditMode:
@@ -1902,6 +1941,7 @@ class TaskManager:
         self._account_check_cache = {}  # Cache for check_and_stop_if_no_accounts {task_id: {'result': bool, 'checked_at': datetime}}
         self.recent_logs = {}  # {task_id: [{'time': datetime, 'target': str, 'status': str, 'message': str, 'account': str}, ...]}
         self.stop_events = {}  # {task_id: asyncio.Event} - for reply monitoring
+        self.current_account_info = {}  # {task_id: {'phone': str, 'sent_today': int, 'daily_limit': int}}
     
     def create_task(self, name, message_text, message_format, media_type=MediaType.TEXT,
                    media_path=None, send_method=SendMethod.DIRECT, postbot_code=None, 
@@ -2550,6 +2590,10 @@ class TaskManager:
                 
                 # 发送消息 - Use stop-aware wrapper
                 logger.info(f"[批次 {batch_idx}] 使用账户 {account.phone} 尝试发送")
+                
+                # Update current account info
+                self._update_current_account(task_id, account)
+                
                 success = await self._send_message_with_stop_check(task, target, account, stop_event)
                 
                 if not success:
@@ -2650,6 +2694,9 @@ class TaskManager:
             consecutive_failures = 0  # 连续失败计数器
             
             logger.info(f"📱 账号 {account.phone} ({account_idx + 1}/{len(accounts)}) 开始工作")
+            
+            # Update current account info
+            self._update_current_account(task_id, account)
             
             # 获取该账号应该发送的目标列表
             available_targets = self._get_available_targets_for_account(
@@ -3925,6 +3972,19 @@ class TaskManager:
         
         # Return last N entries
         return self.recent_logs[task_id][-limit:] if limit else self.recent_logs[task_id]
+    
+    def _update_current_account(self, task_id, account):
+        """Update current account information for task"""
+        task_id_str = str(task_id)
+        self.current_account_info[task_id_str] = {
+            'phone': account.phone,
+            'sent_today': account.messages_sent_today,
+            'daily_limit': account.daily_limit
+        }
+    
+    def _get_current_account(self, task_id):
+        """Get current account information for task"""
+        return self.current_account_info.get(str(task_id))
     
     def _get_account_stats(self, task_id):
         """Get account statistics for task"""
@@ -5840,7 +5900,15 @@ async def show_task_config(query, task_id):
     ]
     
     reply_markup = InlineKeyboardMarkup(keyboard)
-    await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='HTML')
+    
+    # Fix Bug 2: Handle "Message to edit not found" error
+    try:
+        await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='HTML')
+    except telegram_error.BadRequest as e:
+        if "Message to edit not found" in str(e) or "message to edit not found" in str(e):
+            await query.message.reply_text(text, reply_markup=reply_markup, parse_mode='HTML')
+        else:
+            raise
 
 
 async def request_thread_config(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -8214,94 +8282,81 @@ async def auto_refresh_task_progress(bot, chat_id, message_id, task_id):
             else:
                 progress_percent = 0.0
             
-            # 生成进度条
-            progress_bar_length = 10
-            filled = int(progress_percent / 10)
-            progress_bar = '█' * filled + '░' * (progress_bar_length - filled)
+            
+            # Calculate progress bar (20 characters)
+            bar_length = 20
+            filled = int(progress_percent / 5)
+            progress_bar = '█' * filled + '░' * (bar_length - filled)
             
             # 计算时间和速度
+            runtime_str = "00:00:00"
+            speed_str = "计算中..."
+            remaining_str = "计算中..."
+            
             if task.started_at:
-                runtime = datetime.now(timezone.utc) - task.started_at
+                # 确保时区一致 - Fix Bug 1
+                started_at = task.started_at
+                if started_at.tzinfo is None:
+                    started_at = started_at.replace(tzinfo=timezone.utc)
+                
+                runtime = datetime.now(timezone.utc) - started_at
                 hours, remainder = divmod(int(runtime.total_seconds()), 3600)
                 minutes, seconds = divmod(remainder, 60)
-                runtime_str = f"{hours}:{minutes:02d}:{seconds:02d}"
+                runtime_str = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
                 
                 # 计算速度
-                if sent_count + failed_count > 0 and runtime.total_seconds() > 0:
-                    speed = (sent_count + failed_count) / runtime.total_seconds() * 60  # messages per minute
+                processed = sent_count + failed_count
+                if processed > 0 and runtime.total_seconds() > 0:
+                    speed = processed / runtime.total_seconds() * 60  # messages per minute
                     speed_str = f"{speed:.1f} 条/分钟"
                     
                     # 预计剩余时间
-                    remaining_count = total_targets - sent_count - failed_count
+                    remaining_count = total_targets - processed
                     if speed > 0:
                         remaining_seconds = remaining_count / speed * 60
                         rem_hours, rem_remainder = divmod(int(remaining_seconds), 3600)
                         rem_minutes, rem_seconds = divmod(rem_remainder, 60)
-                        remaining_str = f"{rem_hours}:{rem_minutes:02d}:{rem_seconds:02d}"
-                    else:
-                        remaining_str = "计算中..."
-                else:
-                    speed_str = "计算中..."
-                    remaining_str = "计算中..."
-            else:
-                runtime_str = "0:00:00"
-                speed_str = "0.0 条/分钟"
-                remaining_str = "未知"
+                        remaining_str = f"{rem_hours:02d}:{rem_minutes:02d}:{rem_seconds:02d}"
             
-            # Get recent logs and account stats
-            recent_logs = task_manager._get_recent_logs(task_id)
-            account_stats = task_manager._get_account_stats(task_id)
+            # Get current account info
+            account_info = task_manager._get_current_account(task_id)
+            account_section = ""
+            if account_info:
+                masked_phone = mask_phone_number(account_info['phone'])
+                remaining_quota = max(0, account_info['daily_limit'] - account_info['sent_today'])
+                account_section = (
+                    f"\n📱 <b>当前账号</b>\n"
+                    f"• 账号: {masked_phone}\n"
+                    f"• 今日已发: {account_info['sent_today']} 条\n"
+                    f"• 剩余配额: {remaining_quota} 条\n"
+                )
             
-            # Build recent operations display
-            recent_ops_text = ""
+            # Get recent logs
+            recent_logs = task_manager._get_recent_logs(task_id, limit=5)
+            logs_section = ""
             if recent_logs:
-                recent_ops_text = f"\n📝 <b>最近操作</b> (最新{Config.MAX_DISPLAYED_LOGS}条)\n"
-                for log in reversed(recent_logs[-Config.MAX_DISPLAYED_LOGS:]):  # Show newest first
-                    time_str = log['time'].strftime('%H:%M:%S') if isinstance(log['time'], datetime) else str(log['time'])
-                    status_icon = '✅' if log['status'] == 'success' else '❌'
-                    target = log['target']
-                    message = log['message'][:30]  # Truncate long messages
-                    recent_ops_text += f"• {time_str} {status_icon} @{target} {message}\n"
+                logs_section = "\n📝 <b>最近操作</b>\n━━━━━━━━━━━━━━━━\n"
+                for log in reversed(recent_logs):  # Show newest first
+                    time_str, status_emoji, target, message = format_log_entry(log)
+                    logs_section += f"{time_str} {status_emoji} {target} {message}\n"
             
-            # Build account stats display
-            account_stats_text = ""
-            if account_stats:
-                # Get current active account (last one used)
-                current_account = None
-                if recent_logs:
-                    current_account = recent_logs[-1].get('account', 'unknown')
-                    if current_account != 'unknown':
-                        # Find this account's stats
-                        for acc_id, stats in account_stats.items():
-                            if stats['phone'] == current_account:
-                                quota_used = stats['messages_sent_today']
-                                quota_total = stats['daily_limit']
-                                quota_remaining = max(0, quota_total - quota_used)
-                                account_stats_text = (
-                                    f"\n📱 <b>当前账号</b>: {current_account}\n"
-                                    f"• 账号已发送: {stats['success']} 条\n"
-                                    f"• 账号剩余配额: {quota_remaining}/{quota_total}\n"
-                                )
-                                break
-            
-            # 更新消息 - Enhanced with better visual indicators
+            # Build enhanced message
             text = (
                 f"🚀 <b>正在私信中</b>\n\n"
                 f"📊 <b>进度统计</b>\n"
-                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"━━━━━━━━━━━━━━━━\n"
                 f"进度: {sent_count + failed_count}/{total_targets} ({progress_percent:.1f}%)\n"
-                f"{progress_bar}\n\n"
+                f"<code>{progress_bar}</code>\n\n"
                 f"⏱️ <b>时间统计</b>\n"
                 f"• 已运行: {runtime_str}\n"
                 f"• 预计剩余: {remaining_str}\n"
                 f"• 发送速度: {speed_str}\n"
-                f"{account_stats_text}"
-                f"\n📈 <b>发送统计</b>\n"
+                f"{account_section}\n"
+                f"📈 <b>发送统计</b>\n"
                 f"• ✅ 成功: {sent_count}\n"
                 f"• ❌ 失败: {failed_count}\n"
-                f"• ⏸️ 跳过: 0\n"
-                f"{recent_ops_text}"
-                f"\n💡 提示: 任务可随时停止"
+                f"• ⏸️ 待发送: {total_targets - sent_count - failed_count}\n"
+                f"{logs_section}"
             )
             
             keyboard = [
@@ -8310,10 +8365,13 @@ async def auto_refresh_task_progress(bot, chat_id, message_id, task_id):
             ]
             reply_markup = InlineKeyboardMarkup(keyboard)
             
-            try:
-                # Only update if data changed
-                current_data = (sent_count, failed_count, task.status)
-                if current_data != last_data:
+            # Update message only if data changed
+            # Use both timestamp and count for reliable change detection
+            recent_log_timestamp = recent_logs[-1]['time'] if recent_logs else None
+            recent_log_count = len(recent_logs) if recent_logs else 0
+            current_data = (sent_count, failed_count, task.status, recent_log_timestamp, recent_log_count)
+            if current_data != last_data:
+                try:
                     await bot.edit_message_text(
                         text=text,
                         chat_id=chat_id,
@@ -8322,50 +8380,31 @@ async def auto_refresh_task_progress(bot, chat_id, message_id, task_id):
                         parse_mode='HTML'
                     )
                     last_data = current_data
-                # Reset error count on successful update
-                error_count = 0
-            except telegram_error.BadRequest as e:
-                # Handle message not found, deleted, or too old to edit
-                error_str = str(e).lower()
-                if any(keyword in error_str for keyword in ['message to edit not found', 'message can\'t be edited', 'message is not modified', 'message to delete not found']):
-                    logger.info(f"Auto-refresh stopped: message no longer available for task {task_id}")
-                    break  # Stop the refresh loop
-                else:
-                    logger.error(f"BadRequest updating progress: {e}")
+                    error_count = 0
+                except telegram_error.BadRequest as e:
+                    error_str = str(e).lower()
+                    if 'message to edit not found' in error_str or 'message is not modified' in error_str:
+                        pass  # Ignore these errors
+                    else:
+                        error_count += 1
+                except Exception as e:
                     error_count += 1
-            except Exception as e:
-                error_count += 1
-                if "message is not modified" not in str(e).lower():
                     logger.error(f"Failed to update progress: {e}")
-                    if error_count >= Config.MAX_AUTO_REFRESH_ERRORS:
-                        break
             
-            # 智能刷新间隔：前1分钟每10秒，后面30-50秒
+            if error_count >= Config.MAX_AUTO_REFRESH_ERRORS:
+                break
+            
+            # Dynamic refresh interval
             elapsed = (datetime.now(timezone.utc) - start_time).total_seconds()
-            if elapsed < Config.AUTO_REFRESH_FAST_DURATION:
-                # 前1分钟使用快速间隔
-                interval = Config.AUTO_REFRESH_FAST_INTERVAL
-                logger.debug(f"Auto-refresh: fast interval ({interval}s)")
-            else:
-                # 1分钟后使用随机间隔
-                interval = random.randint(Config.AUTO_REFRESH_MIN_INTERVAL, Config.AUTO_REFRESH_MAX_INTERVAL)
-                logger.debug(f"Auto-refresh: normal interval ({interval}s)")
-            
+            interval = Config.AUTO_REFRESH_FAST_INTERVAL if elapsed < Config.AUTO_REFRESH_FAST_DURATION else random.randint(Config.AUTO_REFRESH_MIN_INTERVAL, Config.AUTO_REFRESH_MAX_INTERVAL)
             await asyncio.sleep(interval)
             
         except Exception as e:
             error_count += 1
-            logger.error(f"Error in auto refresh (count: {error_count}/{Config.MAX_AUTO_REFRESH_ERRORS}): {e}")
-            
-            # Stop after max errors to prevent infinite error loops
+            logger.error(f"Error in auto refresh: {e}")
             if error_count >= Config.MAX_AUTO_REFRESH_ERRORS:
-                logger.error(f"Auto-refresh stopped after {Config.MAX_AUTO_REFRESH_ERRORS} consecutive errors")
                 break
-            
-            # Use fast interval for error case during first minute, normal otherwise
-            elapsed = (datetime.now(timezone.utc) - start_time).total_seconds()
-            interval = Config.AUTO_REFRESH_FAST_INTERVAL if elapsed < Config.AUTO_REFRESH_FAST_DURATION else random.randint(Config.AUTO_REFRESH_MIN_INTERVAL, Config.AUTO_REFRESH_MAX_INTERVAL)
-            await asyncio.sleep(interval)
+            await asyncio.sleep(Config.AUTO_REFRESH_FAST_INTERVAL)
 
 
 
@@ -8554,48 +8593,90 @@ async def refresh_task_progress(query, task_id):
         return
     
     task = Task.from_dict(task_doc)
-    progress = (task.sent_count / task.total_targets * 100) if task.total_targets > 0 else 0
     
-    logger.info(f"任务进度: {task.sent_count}/{task.total_targets} ({progress:.1f}%)")
+    # Calculate progress
+    total = task.total_targets or 0
+    sent = task.sent_count or 0
+    failed = task.failed_count or 0
+    processed = sent + failed
+    progress_percent = (processed / total * 100) if total > 0 else 0
     
-    # 构建进度文本
+    # Progress bar (20 characters)
+    bar_length = 20
+    filled = int(progress_percent / 5)
+    progress_bar = '█' * filled + '░' * (bar_length - filled)
+    
+    # Time calculations
+    runtime_str = "00:00:00"
+    speed_str = "计算中..."
+    remaining_str = "计算中..."
+    
+    if task.started_at:
+        # 确保时区一致 - Fix Bug 1
+        started_at = task.started_at
+        if started_at.tzinfo is None:
+            started_at = started_at.replace(tzinfo=timezone.utc)
+        
+        runtime = datetime.now(timezone.utc) - started_at
+        hours, remainder = divmod(int(runtime.total_seconds()), 3600)
+        minutes, seconds = divmod(remainder, 60)
+        runtime_str = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+        
+        if processed > 0 and runtime.total_seconds() > 0:
+            speed = processed / runtime.total_seconds() * 60
+            speed_str = f"{speed:.1f} 条/分钟"
+            
+            remaining_count = total - processed
+            if speed > 0:
+                remaining_seconds = remaining_count / speed * 60
+                rem_hours, rem_remainder = divmod(int(remaining_seconds), 3600)
+                rem_minutes, rem_seconds = divmod(rem_remainder, 60)
+                remaining_str = f"{rem_hours:02d}:{rem_minutes:02d}:{rem_seconds:02d}"
+    
+    # Get current account info
+    account_info = task_manager._get_current_account(task_id)
+    account_section = ""
+    if account_info:
+        masked_phone = mask_phone_number(account_info['phone'])
+        remaining_quota = max(0, account_info['daily_limit'] - account_info['sent_today'])
+        account_section = (
+            f"\n📱 <b>当前账号</b>\n"
+            f"• 账号: {masked_phone}\n"
+            f"• 今日已发: {account_info['sent_today']} 条\n"
+            f"• 剩余配额: {remaining_quota} 条\n"
+        )
+    
+    # Get recent logs
+    recent_logs = task_manager._get_recent_logs(task_id, limit=5)
+    logs_section = ""
+    if recent_logs:
+        logs_section = "\n📝 <b>最近操作</b>\n━━━━━━━━━━━━━━━━\n"
+        for log in reversed(recent_logs):  # Show newest first
+            time_str, status_emoji, target, message = format_log_entry(log)
+            logs_section += f"{time_str} {status_emoji} {target} {message}\n"
+    
+    # Build enhanced message
     text = (
-        f"⬇ <b>正在私信中</b> ⬇\n"
-        f"进度 {task.sent_count}/{task.total_targets} ({progress:.1f}%)\n"
+        f"🚀 <b>正在私信中</b>\n\n"
+        f"📊 <b>进度统计</b>\n"
+        f"━━━━━━━━━━━━━━━━\n"
+        f"进度: {processed}/{total} ({progress_percent:.1f}%)\n"
+        f"<code>{progress_bar}</code>\n\n"
+        f"⏱️ <b>时间统计</b>\n"
+        f"• 已运行: {runtime_str}\n"
+        f"• 预计剩余: {remaining_str}\n"
+        f"• 发送速度: {speed_str}\n"
+        f"{account_section}\n"
+        f"📈 <b>发送统计</b>\n"
+        f"• ✅ 成功: {sent}\n"
+        f"• ❌ 失败: {failed}\n"
+        f"• ⏸️ 待发送: {total - processed}\n"
+        f"{logs_section}"
     )
     
-    # 添加预计剩余时间
-    if task.status == TaskStatus.RUNNING.value:
-        if task.total_targets and task.sent_count is not None and task.failed_count is not None:
-            remaining = task.total_targets - task.sent_count - task.failed_count
-            if remaining > 0 and task.min_interval and task.max_interval:
-                avg_interval = (task.min_interval + task.max_interval) / 2
-                estimated_seconds = remaining * avg_interval
-                estimated_time = timedelta(seconds=int(estimated_seconds))
-                text += f"\n⏱️ 预计剩余: {estimated_time}"
-        
-        if task.started_at:
-            elapsed = datetime.utcnow() - task.started_at
-            text += f"\n⏰ 已运行: {elapsed}"
-    
-    # 创建内联按钮 - 左侧标签，右侧数值
     keyboard = [
-        [
-            InlineKeyboardButton("👥 总用户数", callback_data='noop'),
-            InlineKeyboardButton(f"{task.total_targets}", callback_data='noop')
-        ],
-        [
-            InlineKeyboardButton("✅ 发送成功", callback_data='noop'),
-            InlineKeyboardButton(f"{task.sent_count}", callback_data='noop')
-        ],
-        [
-            InlineKeyboardButton("❌ 发送失败", callback_data='noop'),
-            InlineKeyboardButton(f"{task.failed_count}", callback_data='noop')
-        ],
-        [
-            InlineKeyboardButton("🔄 刷新进度", callback_data=f'task_progress_refresh_{task_id}'),
-            InlineKeyboardButton("⏸️ 停止任务", callback_data=f'task_stop_{task_id}')
-        ]
+        [InlineKeyboardButton("🔄 刷新进度", callback_data=f'task_progress_refresh_{task_id}')],
+        [InlineKeyboardButton("⏹️ 停止任务", callback_data=f'task_stop_{task_id}')]
     ]
     
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -9050,7 +9131,9 @@ def main():
             CallbackQueryHandler(request_bidirect_config, pattern='^cfg_bidirect_'),
             CallbackQueryHandler(request_daily_limit_config, pattern='^cfg_daily_limit_'),
             CallbackQueryHandler(request_retry_config, pattern='^cfg_retry_'),
-            CallbackQueryHandler(request_reply_mode_config, pattern='^cfg_reply_mode_')
+            CallbackQueryHandler(request_reply_mode_config, pattern='^cfg_reply_mode_'),
+            CallbackQueryHandler(request_batch_count_config, pattern='^set_batch_count_'),
+            CallbackQueryHandler(request_batch_delay_config, pattern='^set_batch_delay_')
         ],
         states={
             CONFIG_THREAD_INPUT: [
@@ -9093,6 +9176,16 @@ def main():
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_reply_mode_config),
                 CallbackQueryHandler(handle_config_cancel, pattern='^cfg_cancel_'),
                 CallbackQueryHandler(show_config_example, pattern='^cfg_example_'),
+                CallbackQueryHandler(handle_config_return, pattern='^task_config_')
+            ],
+            CONFIG_BATCH_COUNT_INPUT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_batch_count_config),
+                CallbackQueryHandler(handle_config_cancel, pattern='^cfg_cancel_'),
+                CallbackQueryHandler(handle_config_return, pattern='^task_config_')
+            ],
+            CONFIG_BATCH_DELAY_INPUT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_batch_delay_config),
+                CallbackQueryHandler(handle_config_cancel, pattern='^cfg_cancel_'),
                 CallbackQueryHandler(handle_config_return, pattern='^task_config_')
             ]
         },
