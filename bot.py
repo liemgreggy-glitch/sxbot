@@ -2429,8 +2429,17 @@ class TaskManager:
                 
                 logger.info(f"账号 {account.phone} 完成所有发送")
             
-            # 并发执行当前批次的所有账号
-            await asyncio.gather(*[send_to_all_targets(acc) for acc in account_batch], return_exceptions=True)
+            # 并发执行当前批次的所有账号，支持线程启动间隔
+            concurrent_tasks = []
+            for acc_idx, acc in enumerate(account_batch):
+                # Apply thread start interval (except for first account)
+                if acc_idx > 0 and task.thread_start_interval > 0:
+                    logger.info(f"账号 {acc.phone}: 等待 {task.thread_start_interval} 秒后启动")
+                    await asyncio.sleep(task.thread_start_interval)
+                
+                concurrent_tasks.append(send_to_all_targets(acc))
+            
+            await asyncio.gather(*concurrent_tasks, return_exceptions=True)
             
             logger.info(f"第 {batch_index + 1} 轮完成")
     
@@ -3406,11 +3415,113 @@ class TaskManager:
         # Check if voice call is enabled
         if getattr(task, 'voice_call_enabled', False):
             return await self._send_with_voice_call(task, target, account)
-        else:
-            return await self._send_message(task, target, account)
+        
+        # Check if edit mode is enabled
+        message_mode = getattr(task, 'message_mode', 'normal')
+        if message_mode == 'edit' and getattr(task, 'edit_content', None):
+            return await self._send_message_with_edit(task, target, account)
+        
+        # Normal send
+        success = await self._send_message(task, target, account)
+        
+        # Start reply monitoring if configured and send was successful
+        if success:
+            reply_keywords = getattr(task, 'reply_keywords', None)
+            reply_default = getattr(task, 'reply_default', None)
+            if reply_keywords or reply_default:
+                await self._start_reply_monitoring(task, target, account)
+        
+        return success
+    
+    async def _send_message_with_edit(self, task, target, account):
+        """Send message in edit mode - send initial message then edit it"""
+        try:
+            logger.info(f"使用编辑模式发送消息给 {target.username or target.user_id}")
+            client = await self.account_manager.get_client(str(account._id))
+            
+            # 确定接收者
+            recipient = int(target.user_id) if target.user_id else target.username
+            entity = await client.get_entity(recipient)
+            
+            # 提取用户信息用于消息个性化
+            user_info = MessageFormatter.extract_user_info(entity)
+            
+            # 个性化消息内容
+            initial_message = MessageFormatter.personalize(task.message_text, user_info)
+            edit_content = MessageFormatter.personalize(task.edit_content, user_info)
+            parse_mode = MessageFormatter.get_parse_mode(task.message_format)
+            
+            # Create EditMode instance
+            edit_mode = EditMode(task, self.account_manager)
+            
+            # Send and schedule edit
+            success = await edit_mode.send_and_schedule_edit(
+                client, entity, str(target._id), initial_message, edit_content
+            )
+            
+            if success:
+                self.targets_col.update_one(
+                    {'_id': target._id},
+                    {'$set': {'is_sent': True, 'sent_at': datetime.utcnow()}}
+                )
+                self._log_message(str(task._id), str(account._id), str(target._id), initial_message, True, None)
+                logger.info(f"编辑模式消息发送成功: {recipient}")
+            else:
+                self._log_message(str(task._id), str(account._id), str(target._id), initial_message, False, "Edit failed")
+            
+            return success
+            
+        except Exception as e:
+            error_msg = str(e)
+            logger.error(f"编辑模式发送失败: {e}")
+            target.last_error = f"编辑模式失败: {error_msg[:100]}"
+            self._log_message(str(task._id), str(account._id), str(target._id), task.message_text, False, error_msg)
+            return False
+    
+    async def _start_reply_monitoring(self, task, target, account):
+        """Start reply monitoring for a target after successful send"""
+        try:
+            logger.info(f"启动回复监听: {target.username or target.user_id}")
+            client = await self.account_manager.get_client(str(account._id))
+            
+            # 确定接收者
+            recipient = int(target.user_id) if target.user_id else target.username
+            entity = await client.get_entity(recipient)
+            
+            # Create ReplyMode instance and start monitoring
+            # Note: We need a stop event for this task
+            task_id = str(task._id)
+            if task_id not in self.stop_events:
+                self.stop_events[task_id] = asyncio.Event()
+            
+            reply_mode = ReplyMode(task, self.account_manager)
+            reply_mode.start_monitoring(client, entity, str(target._id), self.stop_events[task_id])
+            
+            logger.info(f"回复监听已启动: {target.username or target.user_id}")
+            
+        except Exception as e:
+            logger.error(f"启动回复监听失败: {e}")
     
     async def _send_message(self, task, target, account):
-        """发送消息 - 支持所有发送方式"""
+        """发送消息 - 支持所有发送方式，包含重试机制"""
+        retry_count = getattr(task, 'retry_count', 0)
+        retry_interval = getattr(task, 'retry_interval', 5)
+        
+        for attempt in range(retry_count + 1):
+            if attempt > 0:
+                logger.info(f"重试发送 (第{attempt}/{retry_count}次): {target.username or target.user_id}")
+                await asyncio.sleep(retry_interval)
+            
+            success = await self._do_send_message(task, target, account)
+            if success:
+                return True
+        
+        # All retries failed
+        logger.warning(f"所有重试均失败: {target.username or target.user_id}")
+        return False
+    
+    async def _do_send_message(self, task, target, account):
+        """实际发送消息的内部方法"""
         try:
             # 获取账户的Telegram客户端
             logger.info(f"使用账户 {account.phone} 发送消息")
@@ -3811,7 +3922,7 @@ class TaskManager:
  CONFIG_THREAD_INPUT, CONFIG_INTERVAL_MIN_INPUT, CONFIG_BIDIRECT_INPUT,
  CONFIG_EDIT_MODE_INPUT, CONFIG_REPLY_MODE_INPUT, CONFIG_BATCH_PAUSE_INPUT,
  CONFIG_VOICE_CALL_INPUT, CONFIG_DAILY_LIMIT_INPUT, CONFIG_RETRY_INPUT,
- CONFIG_THREAD_INTERVAL_INPUT) = range(25)
+ CONFIG_THREAD_INTERVAL_INPUT, CONFIG_BATCH_COUNT_INPUT, CONFIG_BATCH_DELAY_INPUT) = range(27)
 
 # Global managers
 account_manager = None
@@ -4569,6 +4680,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await request_reply_mode_config(update, context)
     elif data.startswith('cfg_batch_pause_'):
         await request_batch_pause_config(update, context)
+    elif data.startswith('set_batch_count_'):
+        await request_batch_count_config(update, context)
+    elif data.startswith('set_batch_delay_'):
+        await request_batch_delay_config(update, context)
     elif data.startswith('disable_batch_pause_'):
         await disable_batch_pause(update, context)
     elif data.startswith('cfg_flood_strategy_'):
@@ -6665,6 +6780,180 @@ async def disable_batch_pause(update: Update, context: ContextTypes.DEFAULT_TYPE
     return await show_config_menu_handler(update, context, task_id)
 
 
+async def request_batch_count_config(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Request batch count configuration"""
+    query = update.callback_query
+    await safe_answer_query(query)
+    task_id = query.data.split('_')[3]
+    context.user_data['config_task_id'] = task_id
+    
+    task_doc = db[Task.COLLECTION_NAME].find_one({'_id': ObjectId(task_id)})
+    task = Task.from_dict(task_doc)
+    batch_pause_count = getattr(task, 'batch_pause_count', 0)
+    
+    text = (
+        f"📊 <b>批次停顿条数配置</b>\n\n"
+        f"当前设置: 每 <b>{batch_pause_count}</b> 条消息停顿\n\n"
+        f"💡 建议范围: 10-50 条\n"
+        f"⚠️ 设置为 0 表示禁用批次停顿\n\n"
+        f"请输入批次停顿条数（如：20）："
+    )
+    
+    prompt_msg = await query.edit_message_text(text, parse_mode='HTML')
+    context.user_data['config_prompt_msg_id'] = prompt_msg.message_id
+    return CONFIG_BATCH_COUNT_INPUT
+
+
+async def handle_batch_count_config(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle batch count configuration input"""
+    try:
+        task_id = context.user_data.get('config_task_id')
+        if not task_id:
+            await update.message.reply_text("❌ 配置会话已过期，请重新开始")
+            return ConversationHandler.END
+        
+        # Parse input
+        batch_count = int(update.message.text.strip())
+        
+        if batch_count < 0:
+            await update.message.reply_text("❌ 批次停顿条数不能为负数，请重新输入")
+            return CONFIG_BATCH_COUNT_INPUT
+        
+        # Update database
+        result = db[Task.COLLECTION_NAME].update_one(
+            {'_id': ObjectId(task_id)},
+            {'$set': {'batch_pause_count': batch_count, 'updated_at': datetime.utcnow()}}
+        )
+        
+        if result.modified_count > 0:
+            logger.info(f"Task {task_id}: Batch pause count updated to {batch_count}")
+        
+        msg = await update.message.reply_text(f"✅ 批次停顿条数已设置为: {batch_count}")
+        
+        # Auto-cleanup
+        await asyncio.sleep(Config.CONFIG_MESSAGE_DELETE_DELAY)
+        try:
+            await update.message.delete()
+            await msg.delete()
+            if 'config_prompt_msg_id' in context.user_data:
+                await context.bot.delete_message(
+                    chat_id=update.effective_chat.id,
+                    message_id=context.user_data['config_prompt_msg_id']
+                )
+        except Exception as e:
+            logger.debug(f"Failed to delete config messages: {e}")
+        
+        return ConversationHandler.END
+        
+    except ValueError:
+        await update.message.reply_text("❌ 格式错误，请输入有效的整数")
+        return CONFIG_BATCH_COUNT_INPUT
+    except Exception as e:
+        logger.error(f"Error handling batch count config: {e}")
+        await update.message.reply_text(f"❌ 配置失败: {str(e)}")
+        return ConversationHandler.END
+
+
+async def request_batch_delay_config(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Request batch delay configuration"""
+    query = update.callback_query
+    await safe_answer_query(query)
+    task_id = query.data.split('_')[3]
+    context.user_data['config_task_id'] = task_id
+    
+    task_doc = db[Task.COLLECTION_NAME].find_one({'_id': ObjectId(task_id)})
+    task = Task.from_dict(task_doc)
+    batch_pause_min = getattr(task, 'batch_pause_min', 0)
+    batch_pause_max = getattr(task, 'batch_pause_max', 5)
+    
+    text = (
+        f"⏱️ <b>批次停顿时长配置</b>\n\n"
+        f"当前设置: 停顿 <b>{batch_pause_min}-{batch_pause_max}</b> 秒\n\n"
+        f"💡 建议范围: 30-300 秒\n"
+        f"📝 系统会在此范围内随机选择停顿时长\n\n"
+        f"请输入停顿时长范围（格式：最小值-最大值，如：30-60）："
+    )
+    
+    prompt_msg = await query.edit_message_text(text, parse_mode='HTML')
+    context.user_data['config_prompt_msg_id'] = prompt_msg.message_id
+    return CONFIG_BATCH_DELAY_INPUT
+
+
+async def handle_batch_delay_config(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle batch delay configuration input"""
+    try:
+        task_id = context.user_data.get('config_task_id')
+        if not task_id:
+            await update.message.reply_text("❌ 配置会话已过期，请重新开始")
+            return ConversationHandler.END
+        
+        # Parse input (format: min-max)
+        text = update.message.text.strip()
+        if '-' not in text:
+            await update.message.reply_text(
+                "❌ 格式错误\n"
+                "正确格式：最小值-最大值（如：30-60）"
+            )
+            return CONFIG_BATCH_DELAY_INPUT
+        
+        parts = text.split('-')
+        if len(parts) != 2:
+            await update.message.reply_text(
+                "❌ 格式错误\n"
+                "正确格式：最小值-最大值（如：30-60）"
+            )
+            return CONFIG_BATCH_DELAY_INPUT
+        
+        min_delay = int(parts[0].strip())
+        max_delay = int(parts[1].strip())
+        
+        if min_delay < 0 or max_delay < 0:
+            await update.message.reply_text("❌ 停顿时长不能为负数，请重新输入")
+            return CONFIG_BATCH_DELAY_INPUT
+        
+        if min_delay > max_delay:
+            await update.message.reply_text("❌ 最小值不能大于最大值，请重新输入")
+            return CONFIG_BATCH_DELAY_INPUT
+        
+        # Update database
+        result = db[Task.COLLECTION_NAME].update_one(
+            {'_id': ObjectId(task_id)},
+            {'$set': {
+                'batch_pause_min': min_delay,
+                'batch_pause_max': max_delay,
+                'updated_at': datetime.utcnow()
+            }}
+        )
+        
+        if result.modified_count > 0:
+            logger.info(f"Task {task_id}: Batch pause delay updated to {min_delay}-{max_delay}")
+        
+        msg = await update.message.reply_text(f"✅ 批次停顿时长已设置为: {min_delay}-{max_delay} 秒")
+        
+        # Auto-cleanup
+        await asyncio.sleep(Config.CONFIG_MESSAGE_DELETE_DELAY)
+        try:
+            await update.message.delete()
+            await msg.delete()
+            if 'config_prompt_msg_id' in context.user_data:
+                await context.bot.delete_message(
+                    chat_id=update.effective_chat.id,
+                    message_id=context.user_data['config_prompt_msg_id']
+                )
+        except Exception as e:
+            logger.debug(f"Failed to delete config messages: {e}")
+        
+        return ConversationHandler.END
+        
+    except ValueError:
+        await update.message.reply_text("❌ 格式错误，请输入有效的整数")
+        return CONFIG_BATCH_DELAY_INPUT
+    except Exception as e:
+        logger.error(f"Error handling batch delay config: {e}")
+        await update.message.reply_text(f"❌ 配置失败: {str(e)}")
+        return ConversationHandler.END
+
+
 async def request_flood_strategy_config(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Request FloodWait strategy configuration"""
     query = update.callback_query
@@ -6764,22 +7053,24 @@ async def request_voice_call_config(update: Update, context: ContextTypes.DEFAUL
     
     text = (
         f"📞 <b>语音拨打配置</b>\n\n"
+        f"⚠️ <b>功能状态：开发中</b>\n"
+        f"此功能需要额外依赖库，暂不可用\n\n"
         f"当前模式: <b>{current_mode}</b>\n"
         f"拨打时长: {voice_duration}秒\n"
         f"拨打后等待: {voice_wait}秒\n\n"
         f"<b>模式说明：</b>\n\n"
         f"❌ <b>禁用</b>\n"
         f"  └─ 不拨打语音电话，直接发送消息\n\n"
-        f"📞 <b>失败继续发（推荐）</b>\n"
+        f"📞 <b>失败继续发（开发中）</b>\n"
         f"  ├─ 发送消息前先拨打语音电话\n"
         f"  ├─ 如果拨打失败，仍然发送消息\n"
         f"  └─ 兼顾互动率和送达率\n\n"
-        f"📞 <b>失败不发</b>\n"
+        f"📞 <b>失败不发（开发中）</b>\n"
         f"  ├─ 发送消息前先拨打语音电话\n"
         f"  ├─ 如果拨打失败，跳过该用户\n"
         f"  └─ 仅对能接通的用户发送\n\n"
-        f"💡 拨打语音电话可能增加互动率\n"
-        f"⚠️ 过度拨打可能被视为骚扰\n\n"
+        f"💡 注意: Telethon库不支持client.call()方法\n"
+        f"🔧 建议: 使用禁用模式，语音功能待后续开发\n\n"
         f"请选择语音拨打模式："
     )
     
