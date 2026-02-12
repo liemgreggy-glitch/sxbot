@@ -8366,7 +8366,9 @@ async def auto_refresh_task_progress(bot, chat_id, message_id, task_id):
             reply_markup = InlineKeyboardMarkup(keyboard)
             
             # Update message only if data changed
-            current_data = (sent_count, failed_count, task.status, len(recent_logs) if recent_logs else 0)
+            # Use timestamp of most recent log instead of count to detect new entries
+            recent_log_timestamp = recent_logs[-1]['time'] if recent_logs else None
+            current_data = (sent_count, failed_count, task.status, recent_log_timestamp)
             if current_data != last_data:
                 try:
                     await bot.edit_message_text(
@@ -8393,7 +8395,7 @@ async def auto_refresh_task_progress(bot, chat_id, message_id, task_id):
             
             # Dynamic refresh interval
             elapsed = (datetime.now(timezone.utc) - start_time).total_seconds()
-            interval = 10 if elapsed < 60 else random.randint(30, 50)
+            interval = Config.AUTO_REFRESH_FAST_INTERVAL if elapsed < Config.AUTO_REFRESH_FAST_DURATION else random.randint(Config.AUTO_REFRESH_MIN_INTERVAL, Config.AUTO_REFRESH_MAX_INTERVAL)
             await asyncio.sleep(interval)
             
         except Exception as e:
@@ -8401,7 +8403,7 @@ async def auto_refresh_task_progress(bot, chat_id, message_id, task_id):
             logger.error(f"Error in auto refresh: {e}")
             if error_count >= Config.MAX_AUTO_REFRESH_ERRORS:
                 break
-            await asyncio.sleep(10)
+            await asyncio.sleep(Config.AUTO_REFRESH_FAST_INTERVAL)
 
 
 
