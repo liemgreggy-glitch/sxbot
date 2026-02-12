@@ -2716,7 +2716,16 @@ class TaskManager:
                 )
             
             # 并发执行当前批次的所有账号
-            await asyncio.gather(*concurrent_tasks, return_exceptions=True)
+            results = await asyncio.gather(*concurrent_tasks, return_exceptions=True)
+            
+            # Log any exceptions from concurrent tasks
+            for idx, result in enumerate(results):
+                if isinstance(result, Exception):
+                    acc = account_batch[idx] if idx < len(account_batch) else None
+                    logger.error(
+                        f"账号 {acc.phone if acc else 'unknown'} 处理异常: {result}",
+                        exc_info=result
+                    )
             
             logger.info(f"第 {batch_index + 1}/{len(account_batches)} 批账号完成工作")
         
@@ -2834,43 +2843,66 @@ class TaskManager:
                     {'$inc': {'failed_count': 1}, '$set': {'updated_at': datetime.utcnow()}}
                 )
                 
-                # 检查是否达到连续失败上限
+                # Check if consecutive failure limit is reached
                 if consecutive_failures >= consecutive_limit:
                     logger.warning(
-                        f"🔍 账号 {account.phone} 连续失败 {consecutive_failures} 次，查询 @spambot 状态..."
+                        f"🔍 Account {account.phone} reached {consecutive_failures} consecutive failures, querying @spambot status..."
                     )
                     
-                    # 主动查询 @spambot 状态
-                    spambot_status = await check_account_real_status(self.account_manager, str(account._id))
-                    
-                    if spambot_status == 'active':
-                        # @spambot 说没有限制，重置计数器继续
-                        consecutive_failures = 0
-                        logger.info(
-                            f"✅ @spambot 确认账号 {account.phone} 状态正常（no limits），"
-                            f"重置连续失败计数，继续发送"
-                        )
-                    elif spambot_status in ['limited', 'banned']:
-                        # @spambot 确认账号受限或被禁，停止该账号
+                    try:
+                        # Query @spambot for account status
+                        spambot_status = await check_account_real_status(self.account_manager, str(account._id))
+                        
+                        if spambot_status == 'active':
+                            # @spambot reports no restrictions, reset counter and continue
+                            consecutive_failures = 0
+                            logger.info(
+                                f"✅ @spambot confirmed account {account.phone} is active (no limits), "
+                                f"resetting failure counter and continuing"
+                            )
+                        elif spambot_status == 'banned':
+                            # @spambot confirmed account is banned, stop this account
+                            logger.error(
+                                f"🛑 @spambot confirmed account {account.phone} is banned, stopping account"
+                            )
+                            
+                            self.db[Account.COLLECTION_NAME].update_one(
+                                {'_id': account._id},
+                                {'$set': {
+                                    'status': AccountStatus.BANNED.value,
+                                    'updated_at': datetime.utcnow()
+                                }}
+                            )
+                            
+                            break  # Stop this account
+                        elif spambot_status == 'limited':
+                            # @spambot confirmed account is limited, stop this account
+                            logger.error(
+                                f"🛑 @spambot confirmed account {account.phone} is limited, stopping account"
+                            )
+                            
+                            self.db[Account.COLLECTION_NAME].update_one(
+                                {'_id': account._id},
+                                {'$set': {
+                                    'status': AccountStatus.LIMITED.value,
+                                    'updated_at': datetime.utcnow()
+                                }}
+                            )
+                            
+                            break  # Stop this account
+                        else:
+                            # Status unknown, log warning and continue trying
+                            logger.warning(
+                                f"⚠️ @spambot status for account {account.phone} is unknown, continuing with caution"
+                            )
+                    except Exception as e:
+                        # Handle exceptions during spambot status check
                         logger.error(
-                            f"🛑 @spambot 确认账号 {account.phone} 状态为 {spambot_status}，停用该账号"
+                            f"❌ Failed to check @spambot status for account {account.phone}: {e}",
+                            exc_info=True
                         )
-                        
-                        # 标记账号状态
-                        status_value = AccountStatus.BANNED.value if spambot_status == 'banned' else AccountStatus.LIMITED.value
-                        self.db[Account.COLLECTION_NAME].update_one(
-                            {'_id': account._id},
-                            {'$set': {
-                                'status': status_value,
-                                'updated_at': datetime.utcnow()
-                            }}
-                        )
-                        
-                        break  # 跳出循环，停止该账号
-                    else:
-                        # 状态未知，保守起见继续尝试但记录警告
                         logger.warning(
-                            f"⚠️ 账号 {account.phone} 的 @spambot 状态未知，继续尝试"
+                            f"⚠️ Continuing with account {account.phone} despite check failure"
                         )
             
             # 消息间隔
