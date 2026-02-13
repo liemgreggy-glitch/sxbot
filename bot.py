@@ -178,7 +178,7 @@ ERROR_MESSAGE_SHORT_LENGTH = 50  # For short error previews (e.g., user not foun
 ERROR_MESSAGE_LONG_LENGTH = 100  # For detailed error messages (e.g., full exception text)
 
 # Default values for force send mode
-DEFAULT_CONSECUTIVE_FAILURE_LIMIT = 30  # Default consecutive failures before switching account
+DEFAULT_CONSECUTIVE_FAILURE_LIMIT = 10  # Default consecutive failures before checking @spambot status
 DEFAULT_ERROR_MESSAGE = "未知错误"  # Default error message when error is not set
 
 
@@ -3673,7 +3673,11 @@ class TaskManager:
     
     async def _send_message(self, task, target, account):
         """发送消息 - 支持所有发送方式，包含重试机制"""
-        retry_count = getattr(task, 'retry_count', 0)
+        # 强制私信模式下不重试，直接跳过失败的目标
+        if getattr(task, 'force_private_mode', False):
+            retry_count = 0
+        else:
+            retry_count = getattr(task, 'retry_count', 0)
         retry_interval = getattr(task, 'retry_interval', 5)
         
         for attempt in range(retry_count + 1):
