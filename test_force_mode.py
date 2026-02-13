@@ -13,9 +13,9 @@ def test_no_retry_in_force_mode():
     with open('bot.py', 'r', encoding='utf-8') as f:
         content = f.read()
     
-    # Find _send_message function
+    # Find _send_message function (flexible indentation pattern)
     match = re.search(
-        r'async def _send_message\(self, task, target, account\):.*?(?=\n    async def |\nclass |\Z)',
+        r'async def _send_message\(self, task, target, account\):.*?(?=\n\s{0,4}async def |\n\s{0,4}class |\Z)',
         content,
         re.DOTALL
     )
@@ -71,9 +71,9 @@ def test_force_mode_implementation():
         print("❌ FAIL: _execute_force_send_mode function not found")
         return False
     
-    # Find the function
+    # Find the function (flexible indentation pattern)
     match = re.search(
-        r'async def _execute_force_send_mode\(.*?\):.*?(?=\n    async def |\nclass |\Z)',
+        r'async def _execute_force_send_mode\(.*?\):.*?(?=\n\s{0,4}async def |\n\s{0,4}class |\Z)',
         content,
         re.DOTALL
     )
@@ -94,9 +94,9 @@ def test_force_mode_implementation():
         print("❌ FAIL: _process_account_force_mode function not found")
         return False
     
-    # Find _process_account_force_mode
+    # Find _process_account_force_mode (flexible indentation pattern)
     match = re.search(
-        r'async def _process_account_force_mode\(.*?\):.*?(?=\n    async def |\nclass |\Z)',
+        r'async def _process_account_force_mode\(.*?\):.*?(?=\n\s{0,4}async def |\n\s{0,4}class |\Z)',
         content,
         re.DOTALL
     )
@@ -141,9 +141,9 @@ def test_spambot_checking():
         print("❌ FAIL: No reference to spambot found")
         return False
     
-    # Find check_account_real_status function
+    # Find check_account_real_status function (flexible indentation pattern)
     match = re.search(
-        r'async def check_account_real_status\(.*?\):.*?(?=\nasync def |\nclass |\Z)',
+        r'async def check_account_real_status\(.*?\):.*?(?=\n\s{0,4}async def |\n\s{0,4}class |\Z)',
         content,
         re.DOTALL
     )

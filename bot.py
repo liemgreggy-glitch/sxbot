@@ -178,7 +178,7 @@ ERROR_MESSAGE_SHORT_LENGTH = 50  # For short error previews (e.g., user not foun
 ERROR_MESSAGE_LONG_LENGTH = 100  # For detailed error messages (e.g., full exception text)
 
 # Default values for force send mode
-DEFAULT_CONSECUTIVE_FAILURE_LIMIT = 10  # Default consecutive failures before checking @spambot status
+DEFAULT_CONSECUTIVE_FAILURE_LIMIT = 10  # Default consecutive failures before checking @spambot status (may mark account as LIMITED/BANNED if confirmed)
 DEFAULT_ERROR_MESSAGE = "未知错误"  # Default error message when error is not set
 
 
