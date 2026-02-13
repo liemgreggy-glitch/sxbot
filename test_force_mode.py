@@ -181,10 +181,10 @@ def main():
     all_passed = True
     
     # Run tests
-    all_passed &= test_no_retry_in_force_mode()
-    all_passed &= test_default_consecutive_limit()
-    all_passed &= test_force_mode_implementation()
-    all_passed &= test_spambot_checking()
+    all_passed = all_passed and test_no_retry_in_force_mode()
+    all_passed = all_passed and test_default_consecutive_limit()
+    all_passed = all_passed and test_force_mode_implementation()
+    all_passed = all_passed and test_spambot_checking()
     
     print()
     print("=" * 70)
