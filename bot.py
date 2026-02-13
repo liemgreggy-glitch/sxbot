@@ -2666,18 +2666,25 @@ class TaskManager:
         logger.info(f"[批次 {batch_idx}] 批次处理完成")
     
     async def _execute_force_send_mode(self, task_id, task, targets, accounts, stop_event):
-        """执行强制私信模式：连续失败计数，达到上限后停用账号并切换"""
+        """执行强制私信模式：多账号并发，连续失败后查询 @spambot 判断账号状态"""
         # 使用 ignore_bidirectional_limit 作为连续失败上限
         consecutive_limit = task.ignore_bidirectional_limit if task.ignore_bidirectional_limit > 0 else DEFAULT_CONSECUTIVE_FAILURE_LIMIT
         
         logger.info("=" * 80)
-        logger.info("执行模式：强制私信模式")
+        logger.info("执行模式：强制私信模式（多账号并发）")
         logger.info(f"目标用户数: {len(targets)}")
         logger.info(f"可用账号数: {len(accounts)}")
+        logger.info(f"线程数: {task.thread_count}")
         logger.info(f"连续失败上限: {consecutive_limit}次")
         logger.info("=" * 80)
         
-        for account_idx, account in enumerate(accounts):
+        # 将账号分批，每批使用 thread_count 个账号并发执行
+        batch_size = task.thread_count
+        account_batches = [accounts[i:i + batch_size] for i in range(0, len(accounts), batch_size)]
+        
+        logger.info(f"账号分批: {len(account_batches)} 批，每批 {batch_size} 个账号并发")
+        
+        for batch_index, account_batch in enumerate(account_batches):
             # Check stop event
             if stop_event.is_set():
                 logger.info(f"Task {task_id}: Stop signal received")
@@ -2691,150 +2698,221 @@ class TaskManager:
                     logger.info(f"Task {task_id}: Status is {task_status}, not RUNNING")
                     break
             
-            consecutive_failures = 0  # 连续失败计数器
+            logger.info("=" * 80)
+            logger.info(f"第 {batch_index + 1}/{len(account_batches)} 批账号开始工作")
+            logger.info(f"使用账号: {[acc.phone for acc in account_batch]}")
+            logger.info("=" * 80)
             
-            logger.info(f"📱 账号 {account.phone} ({account_idx + 1}/{len(accounts)}) 开始工作")
-            
-            # Update current account info
-            self._update_current_account(task_id, account)
-            
-            # 获取该账号应该发送的目标列表
-            available_targets = self._get_available_targets_for_account(
-                task_id,
-                str(account._id),
-                targets
-            )
-            
-            if not available_targets:
-                logger.info(f"账号 {account.phone} 没有可用目标，跳过")
-                continue
-            
-            logger.info(f"账号 {account.phone} 有 {len(available_targets)} 个可用目标")
-            
-            for idx, target in enumerate(available_targets):
-                # Check stop signal
-                if stop_event.is_set():
-                    logger.info(f"账号 {account.phone}: Stop signal detected")
-                    break
+            # 为每个账号创建并发任务
+            concurrent_tasks = []
+            for acc_idx, acc in enumerate(account_batch):
+                # Apply thread start interval (except for first account)
+                if acc_idx > 0 and task.thread_start_interval > 0:
+                    logger.info(f"账号 {acc.phone}: 等待 {task.thread_start_interval} 秒后启动")
+                    await asyncio.sleep(task.thread_start_interval)
                 
-                # Check daily limit
-                account_doc = self.db[Account.COLLECTION_NAME].find_one({'_id': account._id})
-                if account_doc:
-                    account = Account.from_dict(account_doc)
-                    if account.messages_sent_today >= account.daily_limit:
-                        logger.warning(f"账号 {account.phone} 达到每日限额")
-                        break
-                    
-                    # Reset daily counter if needed
-                    if account.last_used and account.last_used.date() < datetime.utcnow().date():
-                        self.db[Account.COLLECTION_NAME].update_one(
-                            {'_id': account._id},
-                            {'$set': {'messages_sent_today': 0, 'updated_at': datetime.utcnow()}}
-                        )
-                        account.messages_sent_today = 0
-                
-                # 发送消息
-                logger.info(f"[{idx+1}/{len(available_targets)}] 账号 {account.phone} -> {target.username or target.user_id}")
-                success = await self._send_message_with_stop_check(task, target, account, stop_event)
-                
-                if success:
-                    # ✅ 成功 → 计数器归零
-                    consecutive_failures = 0
-                    logger.info(
-                        f"✅ [{idx+1}/{len(available_targets)}] "
-                        f"账号 {account.phone} 成功发送给 {target.username or target.user_id}，"
-                        f"连续失败计数归零"
-                    )
-                    
-                    # 更新目标状态
-                    self.targets_col.update_one(
-                        {'_id': target._id},
-                        {'$set': {
-                            'is_sent': True,
-                            'sent_at': datetime.utcnow(),
-                            'last_account_id': str(account._id),
-                            'updated_at': datetime.utcnow()
-                        }}
-                    )
-                    
-                    # 更新任务计数
-                    self.tasks_col.update_one(
-                        {'_id': ObjectId(task_id)},
-                        {'$inc': {'sent_count': 1}, '$set': {'updated_at': datetime.utcnow()}}
-                    )
-                    
-                    # 更新账号统计
-                    self.db[Account.COLLECTION_NAME].update_one(
-                        {'_id': account._id},
-                        {
-                            '$inc': {'messages_sent_today': 1, 'total_messages_sent': 1},
-                            '$set': {'last_used': datetime.utcnow(), 'updated_at': datetime.utcnow()}
-                        }
-                    )
-                    
-                else:
-                    # ❌ 失败 → 计数器+1
-                    consecutive_failures += 1
-                    logger.warning(
-                        f"❌ [{idx+1}/{len(available_targets)}] "
-                        f"账号 {account.phone} 发送失败给 {target.username or target.user_id}，"
-                        f"连续失败: {consecutive_failures}/{consecutive_limit}"
-                    )
-                    
-                    # 更新目标失败记录
-                    self.targets_col.update_one(
-                        {'_id': target._id},
-                        {
-                            '$addToSet': {'failed_accounts': str(account._id)},
-                            '$set': {
-                                'last_error': getattr(target, 'last_error', DEFAULT_ERROR_MESSAGE),
-                                'last_account_id': str(account._id),
-                                'updated_at': datetime.utcnow()
-                            },
-                            '$inc': {'retry_count': 1}
-                        }
-                    )
-                    
-                    # 更新任务失败计数
-                    self.tasks_col.update_one(
-                        {'_id': ObjectId(task_id)},
-                        {'$inc': {'failed_count': 1}, '$set': {'updated_at': datetime.utcnow()}}
-                    )
-                    
-                    # 检查是否达到连续失败上限
-                    if consecutive_failures >= consecutive_limit:
-                        logger.error(
-                            f"🛑 账号 {account.phone} 连续失败 {consecutive_failures} 次，停用该账号"
-                        )
-                        
-                        # 标记账号为受限
-                        self.db[Account.COLLECTION_NAME].update_one(
-                            {'_id': account._id},
-                            {'$set': {
-                                'status': AccountStatus.LIMITED.value,
-                                'updated_at': datetime.utcnow()
-                            }}
-                        )
-                        
-                        break  # 跳出内层循环，换下一个账号
-                
-                # 消息间隔
-                delay = random.randint(task.min_interval, task.max_interval)
-                interrupted = await self._sleep_with_stop_check(delay, stop_event, task_id)
-                if interrupted:
-                    logger.info(f"账号 {account.phone}: Stop signal during interval")
-                    break
+                concurrent_tasks.append(
+                    self._process_account_force_mode(task_id, task, targets, acc, consecutive_limit, stop_event)
+                )
             
-            # 如果账号正常结束（没有达到连续失败上限）
-            if consecutive_failures < consecutive_limit:
-                logger.info(f"✅ 账号 {account.phone} 正常完成工作")
+            # 并发执行当前批次的所有账号
+            results = await asyncio.gather(*concurrent_tasks, return_exceptions=True)
             
-            # Check stop signal before next account
-            if stop_event.is_set():
-                logger.info(f"Task {task_id}: Stop signal before next account")
-                break
+            # Log any exceptions from concurrent tasks
+            for idx, result in enumerate(results):
+                if isinstance(result, Exception):
+                    acc = account_batch[idx] if idx < len(account_batch) else None
+                    logger.error(
+                        f"账号 {acc.phone if acc else 'unknown'} 处理异常: {result}",
+                        exc_info=result
+                    )
+            
+            logger.info(f"第 {batch_index + 1}/{len(account_batches)} 批账号完成工作")
         
         logger.info(f"Task {task_id}: Force send mode completed")
+    
+    async def _process_account_force_mode(self, task_id, task, targets, account, consecutive_limit, stop_event):
+        """处理单个账号的强制私信任务"""
+        consecutive_failures = 0  # 连续失败计数器
+        
+        logger.info(f"📱 账号 {account.phone} 开始工作")
+        
+        # Update current account info
+        self._update_current_account(task_id, account)
+        
+        # 获取该账号应该发送的目标列表
+        available_targets = self._get_available_targets_for_account(
+            task_id,
+            str(account._id),
+            targets
+        )
+        
+        if not available_targets:
+            logger.info(f"账号 {account.phone} 没有可用目标，跳过")
+            return
+        
+        logger.info(f"账号 {account.phone} 有 {len(available_targets)} 个可用目标")
+        
+        for idx, target in enumerate(available_targets):
+            # Check stop signal
+            if stop_event.is_set():
+                logger.info(f"账号 {account.phone}: Stop signal detected")
+                break
+            
+            # Check daily limit
+            account_doc = self.db[Account.COLLECTION_NAME].find_one({'_id': account._id})
+            if account_doc:
+                account = Account.from_dict(account_doc)
+                if account.messages_sent_today >= account.daily_limit:
+                    logger.warning(f"账号 {account.phone} 达到每日限额")
+                    break
+                
+                # Reset daily counter if needed
+                if account.last_used and account.last_used.date() < datetime.utcnow().date():
+                    self.db[Account.COLLECTION_NAME].update_one(
+                        {'_id': account._id},
+                        {'$set': {'messages_sent_today': 0, 'updated_at': datetime.utcnow()}}
+                    )
+                    account.messages_sent_today = 0
+            
+            # 发送消息
+            logger.info(f"[{idx+1}/{len(available_targets)}] 账号 {account.phone} -> {target.username or target.user_id}")
+            success = await self._send_message_with_stop_check(task, target, account, stop_event)
+            
+            if success:
+                # ✅ 成功 → 计数器归零
+                consecutive_failures = 0
+                logger.info(
+                    f"✅ [{idx+1}/{len(available_targets)}] "
+                    f"账号 {account.phone} 成功发送给 {target.username or target.user_id}，"
+                    f"连续失败计数归零"
+                )
+                
+                # 更新目标状态
+                self.targets_col.update_one(
+                    {'_id': target._id},
+                    {'$set': {
+                        'is_sent': True,
+                        'sent_at': datetime.utcnow(),
+                        'last_account_id': str(account._id),
+                        'updated_at': datetime.utcnow()
+                    }}
+                )
+                
+                # 更新任务计数
+                self.tasks_col.update_one(
+                    {'_id': ObjectId(task_id)},
+                    {'$inc': {'sent_count': 1}, '$set': {'updated_at': datetime.utcnow()}}
+                )
+                
+                # 更新账号统计
+                self.db[Account.COLLECTION_NAME].update_one(
+                    {'_id': account._id},
+                    {
+                        '$inc': {'messages_sent_today': 1, 'total_messages_sent': 1},
+                        '$set': {'last_used': datetime.utcnow(), 'updated_at': datetime.utcnow()}
+                    }
+                )
+                
+            else:
+                # ❌ 失败 → 计数器+1
+                consecutive_failures += 1
+                logger.warning(
+                    f"❌ [{idx+1}/{len(available_targets)}] "
+                    f"账号 {account.phone} 发送失败给 {target.username or target.user_id}，"
+                    f"连续失败: {consecutive_failures}/{consecutive_limit}"
+                )
+                
+                # 更新目标失败记录
+                self.targets_col.update_one(
+                    {'_id': target._id},
+                    {
+                        '$addToSet': {'failed_accounts': str(account._id)},
+                        '$set': {
+                            'last_error': getattr(target, 'last_error', DEFAULT_ERROR_MESSAGE),
+                            'last_account_id': str(account._id),
+                            'updated_at': datetime.utcnow()
+                        },
+                        '$inc': {'retry_count': 1}
+                    }
+                )
+                
+                # 更新任务失败计数
+                self.tasks_col.update_one(
+                    {'_id': ObjectId(task_id)},
+                    {'$inc': {'failed_count': 1}, '$set': {'updated_at': datetime.utcnow()}}
+                )
+                
+                # Check if consecutive failure limit is reached
+                if consecutive_failures >= consecutive_limit:
+                    logger.warning(
+                        f"🔍 Account {account.phone} reached {consecutive_failures} consecutive failures, querying @spambot status..."
+                    )
+                    
+                    try:
+                        # Query @spambot for account status
+                        spambot_status = await check_account_real_status(self.account_manager, str(account._id))
+                        
+                        if spambot_status == 'active':
+                            # @spambot reports no restrictions, reset counter and continue
+                            consecutive_failures = 0
+                            logger.info(
+                                f"✅ @spambot confirmed account {account.phone} is active (no limits), "
+                                f"resetting failure counter and continuing"
+                            )
+                        elif spambot_status == 'banned':
+                            # @spambot confirmed account is banned, stop this account
+                            logger.error(
+                                f"🛑 @spambot confirmed account {account.phone} is banned, stopping account"
+                            )
+                            
+                            self.db[Account.COLLECTION_NAME].update_one(
+                                {'_id': account._id},
+                                {'$set': {
+                                    'status': AccountStatus.BANNED.value,
+                                    'updated_at': datetime.utcnow()
+                                }}
+                            )
+                            
+                            break  # Stop this account
+                        elif spambot_status == 'limited':
+                            # @spambot confirmed account is limited, stop this account
+                            logger.error(
+                                f"🛑 @spambot confirmed account {account.phone} is limited, stopping account"
+                            )
+                            
+                            self.db[Account.COLLECTION_NAME].update_one(
+                                {'_id': account._id},
+                                {'$set': {
+                                    'status': AccountStatus.LIMITED.value,
+                                    'updated_at': datetime.utcnow()
+                                }}
+                            )
+                            
+                            break  # Stop this account
+                        else:
+                            # Status unknown, log warning and continue trying
+                            logger.warning(
+                                f"⚠️ @spambot status for account {account.phone} is unknown, continuing with caution"
+                            )
+                    except Exception as e:
+                        # Handle exceptions during spambot status check
+                        logger.error(
+                            f"❌ Failed to check @spambot status for account {account.phone}: {e}",
+                            exc_info=True
+                        )
+                        logger.warning(
+                            f"⚠️ Continuing with account {account.phone} despite check failure"
+                        )
+            
+            # 消息间隔
+            delay = random.randint(task.min_interval, task.max_interval)
+            interrupted = await self._sleep_with_stop_check(delay, stop_event, task_id)
+            if interrupted:
+                logger.info(f"账号 {account.phone}: Stop signal during interval")
+                break
+        
+        logger.info(f"✅ 账号 {account.phone} 完成工作")
     
     def _get_available_targets_for_account(self, task_id, account_id, targets):
         """获取账号可用的目标列表（优先未尝试的）"""
