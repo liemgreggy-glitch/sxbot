@@ -4,34 +4,30 @@
 """
 import os
 from dotenv import load_dotenv
-from sqlalchemy import create_engine
-from sqlalchemy.ext.declarative import declarative_base
+from pymongo import MongoClient
+import caiji
 
 # 加载环境变量
 load_dotenv()
 
-# 从 bot.py 导入模型
-import sys
-sys.path.insert(0, os.path.dirname(__file__))
 
-from bot import Base, Config
-
-def init_database():
-    """初始化数据库"""
-    print("🔧 初始化数据库...")
-    
-    # 确保目录存在
-    Config.ensure_directories()
-    
-    # 创建数据库引擎
-    engine = create_engine(Config.DATABASE_URL)
-    
-    # 创建所有表
-    Base.metadata.create_all(engine)
-    
-    print("✅ 数据库初始化完成！")
-    print(f"📊 数据库位置: {Config.DATABASE_URL}")
+def init_db(mongo_uri, db_name):
+    """初始化 MongoDB 数据库并创建索引"""
+    client = MongoClient(mongo_uri)
+    db = client[db_name]
+    caiji.init_collection_indexes(db)
+    return db
 
 
 if __name__ == '__main__':
-    init_database()
+    mongo_uri = os.getenv('MONGODB_URI', 'mongodb://localhost:27017/')
+    db_name = os.getenv('MONGODB_DATABASE', 'telegram_bot')
+    print("🔧 初始化数据库...")
+    client = MongoClient(mongo_uri)
+    try:
+        db = client[db_name]
+        caiji.init_collection_indexes(db)
+        print(f"✅ 数据库初始化完成！")
+        print(f"📊 数据库: {db_name} @ {mongo_uri}")
+    finally:
+        client.close()

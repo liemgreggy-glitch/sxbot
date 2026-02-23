@@ -1028,7 +1028,8 @@ async def show_collection_menu(query):
 
 async def show_collection_accounts_menu(query):
     """显示采集账户管理菜单"""
-    from bot import db, Account, AccountStatus
+    db = _get_db()
+    from bot import Account, AccountStatus
     
     # 统计采集账户
     total_accounts = db[Account.COLLECTION_NAME].count_documents({
@@ -1058,7 +1059,8 @@ async def show_collection_accounts_menu(query):
 
 async def list_collection_accounts(query):
     """显示采集账户列表"""
-    from bot import db, Account, AccountStatus
+    db = _get_db()
+    from bot import Account, AccountStatus
     
     # 只查询 collection 类型的账户
     account_docs = db[Account.COLLECTION_NAME].find({'account_type': 'collection'})
