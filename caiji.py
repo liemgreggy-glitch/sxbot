@@ -9,6 +9,7 @@ import logging
 from datetime import datetime
 from bson import ObjectId
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import error as telegram_error
 from telegram.ext import ConversationHandler
 from telethon import TelegramClient
 from telethon.tl.functions.messages import GetHistoryRequest, GetRepliesRequest
@@ -738,7 +739,7 @@ class CollectionManager:
                 if not dialog.is_channel and not dialog.is_group:
                     continue
                 
-                if keyword.lower() not in dialog.title.lower():
+                if not dialog.title or keyword.lower() not in dialog.title.lower():
                     continue
                 
                 # 保存群组/频道
@@ -1028,7 +1029,8 @@ async def show_collection_menu(query):
 
 async def show_collection_accounts_menu(query):
     """显示采集账户管理菜单"""
-    from bot import db, Account, AccountStatus
+    db = _get_db()
+    from bot import Account, AccountStatus
     
     # 统计采集账户
     total_accounts = db[Account.COLLECTION_NAME].count_documents({
@@ -1058,7 +1060,8 @@ async def show_collection_accounts_menu(query):
 
 async def list_collection_accounts(query):
     """显示采集账户列表"""
-    from bot import db, Account, AccountStatus
+    db = _get_db()
+    from bot import Account, AccountStatus
     
     # 只查询 collection 类型的账户
     account_docs = db[Account.COLLECTION_NAME].find({'account_type': 'collection'})
@@ -1079,7 +1082,7 @@ async def list_collection_accounts(query):
             text += (
                 f"{status_emoji} <b>{account.phone}</b>\n"
                 f"   状态: {account.status}\n"
-                f"   格式: {account.session_name.split('.')[-1]}\n\n"
+                f"   格式: {account.session_name.split('.')[-1] if account.session_name else 'N/A'}\n\n"
             )
         
         keyboard.append([InlineKeyboardButton("🔙 返回", callback_data='collection_accounts_menu')])
@@ -1415,7 +1418,10 @@ async def handle_collection_keyword(update, context):
 async def show_filter_config(update, context):
     """显示过滤器配置"""
     query = update.callback_query
-    await query.answer()
+    try:
+        await query.answer()
+    except telegram_error.BadRequest:
+        pass
     filters = context.user_data.get('collection_filters', {})
     
     text = "⚙️ <b>过滤器配置</b>\n\n"
